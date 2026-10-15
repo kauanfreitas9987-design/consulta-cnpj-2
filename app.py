@@ -7,7 +7,10 @@ import pandas as pd
 import requests
 import streamlit as st
 from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
+
+# ==========================================
+# CONFIGURAÇÕES DO SITE
+# ==========================================
 
 st.set_page_config(
     page_title="Consulta de CNPJs",
@@ -16,17 +19,29 @@ st.set_page_config(
 )
 
 st.title("Consulta de CNPJs")
-st.caption("Consulte o status cadastral e baixe o resultado em Excel.")
+st.caption("Consulte os status cadastrais e baixe os resultados em Excel.")
 
 OPENCNPJ_URL = "https://kitana.opencnpj.com/cnpj/{}"
 BRASILAPI_URL = "https://brasilapi.com.br/api/cnpj/v1/{}"
 
-TIMEOUT = 20
 MAX_CNPJS = 10_000
+TIMEOUT = 20
 HEADERS = {"User-Agent": "ConsultaCNPJ/1.0"}
 
 COLUNAS = ["CNPJ", "Status"]
 
+STATUS_VALIDOS = [
+    "ATIVO",
+    "BAIXADO",
+    "NULO",
+    "INAPTO",
+    "SUSPENSO",
+]
+
+
+# ==========================================
+# NORMALIZAR CNPJ
+# ==========================================
 
 def normalizar_cnpj(valor):
     if valor is None or pd.isna(valor):
@@ -40,6 +55,10 @@ def normalizar_cnpj(valor):
     return digitos.zfill(14) if len(digitos) <= 14 else digitos
 
 
+# ==========================================
+# LER ARQUIVO EXCEL OU CSV
+# ==========================================
+
 def ler_arquivo(arquivo):
     if arquivo is None:
         return []
@@ -47,23 +66,31 @@ def ler_arquivo(arquivo):
     if arquivo.name.lower().endswith(".xlsx"):
         df = pd.read_excel(arquivo, dtype=str)
     else:
-        df = pd.read_csv(
-            arquivo,
-            dtype=str,
-            sep=None,
-            engine="python",
-            encoding="utf-8-sig",
-        )
+        conteudo = arquivo.getvalue()
+
+        try:
+            df = pd.read_csv(
+                io.BytesIO(conteudo),
+                dtype=str,
+                sep=None,
+                engine="python",
+                encoding="utf-8-sig",
+            )
+        except Exception:
+            df = pd.read_csv(
+                io.BytesIO(conteudo),
+                dtype=str,
+                encoding="latin-1",
+            )
 
     if df.empty:
         return []
 
     coluna = next(
         (
-            c for c in df.columns
-            if str(c).strip().lower() in (
-                "cnpj", "cnpjs", "documento"
-            )
+            nome for nome in df.columns
+            if str(nome).strip().lower()
+            in ("cnpj", "cnpjs", "documento")
         ),
         None,
     )
@@ -75,11 +102,15 @@ def ler_arquivo(arquivo):
     )
 
     return [
-        normalizar_cnpj(v)
-        for v in valores
-        if normalizar_cnpj(v)
+        normalizar_cnpj(valor)
+        for valor in valores
+        if normalizar_cnpj(valor)
     ]
 
+
+# ==========================================
+# NORMALIZAR SITUAÇÃO CADASTRAL
+# ==========================================
 
 def normalizar_status(situacao):
     if situacao is None:
@@ -87,7 +118,7 @@ def normalizar_status(situacao):
 
     texto = str(situacao).strip().upper()
 
-    # Códigos oficiais de situação cadastral da Receita Federal.
+    # Códigos de situação cadastral.
     codigos = {
         "01": "NULO",
         "02": "ATIVO",
@@ -96,7 +127,11 @@ def normalizar_status(situacao):
         "08": "BAIXADO",
     }
 
-    # Primeiro, procura a descrição da situação.
+    # Reconhece códigos numéricos, quando fornecidos.
+    if re.fullmatch(r"\d{1,2}", texto):
+        return codigos.get(texto.zfill(2))
+
+    # Reconhece descrições por extenso.
     if "ATIVA" in texto or "ATIVO" in texto:
         return "ATIVO"
 
@@ -112,15 +147,12 @@ def normalizar_status(situacao):
     if "NULA" in texto or "NULO" in texto:
         return "NULO"
 
-    # Se vier um código numérico, tenta identificá-lo.
-    codigo = re.match(r"^\s*(\d{1,2})(?:\s*[-–:.]\s*|\s*$)", texto)
-
-    if codigo:
-        numero = codigo.group(1).zfill(2)
-        return codigos.get(numero)
-
     return None
 
+
+# ==========================================
+# CONSULTAR UMA FONTE
+# ==========================================
 
 def consultar_fonte(url, cnpj, fonte):
     try:
@@ -135,12 +167,20 @@ def consultar_fonte(url, cnpj, fonte):
 
         dados = resposta.json()
 
+        if not isinstance(dados, dict):
+            return None
+
         if fonte == "OpenCNPJ":
             if not dados.get("success"):
                 return None
 
             dados = dados.get("data") or {}
+
+            if not isinstance(dados, dict):
+                return None
+
             situacao = dados.get("situacaoCadastral")
+
         else:
             situacao = (
                 dados.get("descricao_situacao_cadastral")
@@ -149,51 +189,92 @@ def consultar_fonte(url, cnpj, fonte):
 
         return normalizar_status(situacao)
 
-    except (requests.RequestException, ValueError, TypeError):
+    except (
+        requests.RequestException,
+        ValueError,
+        TypeError,
+    ):
         return None
 
 
+# ==========================================
+# CONSULTAR CNPJ NAS DUAS APIS
+# ==========================================
+
 def consultar_cnpj(cnpj):
+    fontes = [
+        (OPENCNPJ_URL, "OpenCNPJ"),
+        (BRASILAPI_URL, "BrasilAPI"),
+    ]
+
+    # Tenta as fontes duas vezes em caso de falha.
     for tentativa in range(2):
-        for url, fonte in (
-            (OPENCNPJ_URL, "OpenCNPJ"),
-            (BRASILAPI_URL, "BrasilAPI"),
-        ):
+        for url, fonte in fontes:
             status = consultar_fonte(url, cnpj, fonte)
 
-            if status:
-                return {"CNPJ": cnpj, "Status": status}
+            if status in STATUS_VALIDOS:
+                return {
+                    "CNPJ": cnpj,
+                    "Status": status,
+                }
 
         if tentativa == 0:
             time.sleep(2)
 
-    return {"CNPJ": cnpj, "Status": "ERRO NA CONSULTA"}
+    # Não inventa uma situação quando não há confirmação.
+    return {
+        "CNPJ": cnpj,
+        "Status": "ERRO NA CONSULTA",
+    }
 
+
+# ==========================================
+# GERAR EXCEL SIMPLES
+# ==========================================
 
 def gerar_excel(resultados):
     df = pd.DataFrame(resultados, columns=COLUNAS)
     arquivo = io.BytesIO()
 
-    with pd.ExcelWriter(arquivo, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="CNPJs")
+    with pd.ExcelWriter(
+        arquivo,
+        engine="openpyxl",
+    ) as writer:
+
+        df.to_excel(
+            writer,
+            index=False,
+            sheet_name="CNPJs",
+        )
 
         planilha = writer.sheets["CNPJs"]
+
         planilha.freeze_panes = "A2"
         planilha.auto_filter.ref = planilha.dimensions
 
         for celula in planilha[1]:
-            celula.font = Font(bold=True, color="FFFFFF")
-            celula.fill = PatternFill(
-                "solid", fgColor="1F4E78"
+            celula.font = Font(
+                bold=True,
+                color="FFFFFF",
             )
-            celula.alignment = Alignment(horizontal="center")
+            celula.fill = PatternFill(
+                "solid",
+                fgColor="1F4E78",
+            )
+            celula.alignment = Alignment(
+                horizontal="center",
+            )
 
         planilha.column_dimensions["A"].width = 22
-        planilha.column_dimensions["B"].width = 24
+        planilha.column_dimensions["B"].width = 25
 
     arquivo.seek(0)
     return arquivo.getvalue()
 
+
+# ==========================================
+# ENTRADA DOS CNPJS
+# ==========================================
 
 arquivo = st.file_uploader(
     "Enviar arquivo Excel ou CSV (opcional)",
@@ -212,68 +293,205 @@ except Exception:
     st.error("Não foi possível ler o arquivo enviado.")
     cnpjs = []
 
+# Aceita CNPJs colados, separados por linhas,
+# vírgulas, ponto e vírgula ou espaços.
 cnpjs += [
-    normalizar_cnpj(v)
-    for v in re.split(r"[\s,;]+", texto or "")
-    if normalizar_cnpj(v)
+    normalizar_cnpj(valor)
+    for valor in re.split(r"[\s,;]+", texto or "")
+    if normalizar_cnpj(valor)
 ]
 
-# Remove duplicados, mantendo a ordem original.
+# Remove duplicados sem alterar a ordem.
 cnpjs = list(dict.fromkeys(cnpjs))
 
-invalidos = [c for c in cnpjs if len(c) != 14]
-validos = [c for c in cnpjs if len(c) == 14]
+validos = [
+    cnpj for cnpj in cnpjs
+    if len(cnpj) == 14
+]
 
-st.caption(f"{len(cnpjs)} CNPJs recebidos • {len(validos)} prontos para consulta")
+invalidos = [
+    cnpj for cnpj in cnpjs
+    if len(cnpj) != 14
+]
+
+st.caption(
+    f"CNPJs únicos: {len(cnpjs):,}".replace(",", ".")
+)
 
 if len(cnpjs) > MAX_CNPJS:
-    st.error("O limite é de 10.000 CNPJs por consulta.")
+    st.error(
+        "O limite é de 10.000 CNPJs únicos por consulta. "
+        "Divida a lista em lotes menores."
+    )
     st.stop()
 
 if invalidos:
-    with st.expander(f"Ver {len(invalidos)} entradas com formato inválido"):
+    with st.expander(
+        f"Ver {len(invalidos)} entrada(s) com formato inválido"
+    ):
         st.write(invalidos[:200])
 
-if "resultados" not in st.session_state:
-    st.session_state.resultados = None
+
+# ==========================================
+# GUARDAR RESULTADOS
+# ==========================================
+
+if "resultados_cnpjs" not in st.session_state:
+    st.session_state.resultados_cnpjs = None
+
+
+# ==========================================
+# BOTÃO DE CONSULTA
+# ==========================================
 
 if st.button(
     "Consultar CNPJs",
     type="primary",
-    disabled=not cnpjs,
     use_container_width=True,
+    disabled=not cnpjs,
 ):
-    resultados = [
-        {"CNPJ": c, "Status": "ERRO NA CONSULTA"}
-        for c in invalidos
-    ]
 
-    barra = st.progress(0, text="Iniciando consulta...")
+    resultados = []
 
-    for i, cnpj in enumerate(validos, start=1):
-        resultados.append(consultar_cnpj(cnpj))
+    # Registra entradas inválidas separadamente.
+    for cnpj in invalidos:
+        resultados.append({
+            "CNPJ": cnpj,
+            "Status": "FORMATO INVÁLIDO",
+        })
+
+    barra = st.progress(
+        0,
+        text="Iniciando consulta...",
+    )
+
+    total_validos = len(validos)
+
+    for indice, cnpj in enumerate(validos, start=1):
+        resultado = consultar_cnpj(cnpj)
+        resultados.append(resultado)
 
         barra.progress(
-            i / max(len(validos), 1),
-            text=f"Consultando {i} de {len(validos)} CNPJs",
+            indice / max(total_validos, 1),
+            text=(
+                f"Consultando {indice:,} de "
+                f"{total_validos:,} CNPJs"
+            ).replace(",", "."),
         )
 
-        if i < len(validos):
+        if indice < total_validos:
             time.sleep(0.3)
 
-    ordem = {c: i for i, c in enumerate(cnpjs)}
-    resultados.sort(key=lambda r: ordem.get(r["CNPJ"], 10**9))
+    # Mantém a mesma ordem da lista original.
+    ordem = {
+        cnpj: indice
+        for indice, cnpj in enumerate(cnpjs)
+    }
 
-    st.session_state.resultados = resultados
-    barra.progress(1.0, text="Consulta concluída!")
+    resultados.sort(
+        key=lambda item: ordem.get(
+            item["CNPJ"],
+            10**9,
+        )
+    )
 
-if st.session_state.resultados is not None:
+    st.session_state.resultados_cnpjs = resultados
+
+    barra.progress(
+        1.0,
+        text="Consulta concluída!",
+    )
+
+
+# ==========================================
+# PAINEL DE RESULTADOS
+# ==========================================
+
+if st.session_state.resultados_cnpjs is not None:
+
     df = pd.DataFrame(
-        st.session_state.resultados,
+        st.session_state.resultados_cnpjs,
         columns=COLUNAS,
     )
 
-    st.subheader("Resultados")
+    # Padroniza os textos para contar corretamente.
+    contagens = (
+        df["Status"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .value_counts()
+    )
+
+    total = len(df)
+
+    ativos = int(contagens.get("ATIVO", 0))
+    baixados = int(contagens.get("BAIXADO", 0))
+    nulos = int(contagens.get("NULO", 0))
+    inaptos = int(contagens.get("INAPTO", 0))
+    suspensos = int(contagens.get("SUSPENSO", 0))
+    erros = int(contagens.get("ERRO NA CONSULTA", 0))
+    invalidos = int(contagens.get("FORMATO INVÁLIDO", 0))
+
+    st.divider()
+    st.subheader("Painel de resultados")
+
+    # Total geral.
+    st.metric(
+        "Total processado",
+        f"{total:,}".replace(",", "."),
+    )
+
+    # Primeira linha.
+    col1, col2 = st.columns(2)
+
+    col1.metric(
+        "Ativos",
+        f"{ativos:,}".replace(",", "."),
+    )
+
+    col2.metric(
+        "Baixados",
+        f"{baixados:,}".replace(",", "."),
+    )
+
+    # Segunda linha.
+    col3, col4 = st.columns(2)
+
+    col3.metric(
+        "Nulos",
+        f"{nulos:,}".replace(",", "."),
+    )
+
+    col4.metric(
+        "Inaptos",
+        f"{inaptos:,}".replace(",", "."),
+    )
+
+    # Terceira linha.
+    col5, col6 = st.columns(2)
+
+    col5.metric(
+        "Suspensos",
+        f"{suspensos:,}".replace(",", "."),
+    )
+
+    col6.metric(
+        "Erros na consulta",
+        f"{erros:,}".replace(",", "."),
+    )
+
+    # Formatos inválidos não são situações cadastrais.
+    if invalidos:
+        st.metric(
+            "Formato inválido",
+            f"{invalidos:,}".replace(",", "."),
+        )
+
+    st.divider()
+    st.subheader("Resultados individuais")
+
     st.dataframe(
         df,
         use_container_width=True,
@@ -282,15 +500,22 @@ if st.session_state.resultados is not None:
 
     st.download_button(
         "Baixar Excel",
-        data=gerar_excel(st.session_state.resultados),
+        data=gerar_excel(
+            st.session_state.resultados_cnpjs
+        ),
         file_name="consulta_cnpjs.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
         type="primary",
         use_container_width=True,
     )
 
+st.divider()
+
 st.caption(
-    "Os resultados dependem da disponibilidade e atualização "
-    "das fontes consultadas. Confirme situações duvidosas "
-    "nos canais oficiais da Receita Federal."
+    "Os resultados dependem da disponibilidade e da atualização "
+    "das fontes consultadas. Para confirmação oficial, consulte "
+    "a Receita Federal."
 )
